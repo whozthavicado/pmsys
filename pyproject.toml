@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Sistema cuantitativo de picks para mercados de predicción (spec 1.4.1)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 dependencies = [
     "pydantic>=2.7,<3",
 ]

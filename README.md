@@ -18,3 +18,7 @@ Los tests corren con la red bloqueada (`pytest-socket`). Los secretos solo se le
 de entorno; ver `.env.example`.
 
 Las decisiones de diseño no triviales están en [`docs/adr/`](docs/adr/).
+
+## Licencia
+
+[MIT](LICENSE). Esto no es asesoramiento financiero: el sistema es un proyecto de investigación.
