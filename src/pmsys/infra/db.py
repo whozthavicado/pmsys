@@ -22,12 +22,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from pmsys.core.errors import PmsysError
+
 DEFAULT_MIGRATIONS_DIR = Path(__file__).resolve().parents[3] / "migrations"
 _MIGRATION_RE = re.compile(r"^(\d{4})_[a-z0-9_]+\.sql$")
 
 
-class MigrationError(RuntimeError):
-    """Fallo de migración. TODO: pasar a subclase de PmsysError cuando exista core.errors."""
+class MigrationError(PmsysError):
+    """Fallo de migración."""
 
 
 class Db(Protocol):

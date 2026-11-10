@@ -1,0 +1,13 @@
+{
+  "method": "GET",
+  "url": "https://api.example.test/v1/limited",
+  "recorded_at": null,
+  "synthetic": true,
+  "response": {
+    "status": 429,
+    "headers": {
+      "retry-after": "2"
+    },
+    "body": "{\"error\":\"slow down\"}"
+  }
+}
