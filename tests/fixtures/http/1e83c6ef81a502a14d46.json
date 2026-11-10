@@ -1,0 +1,13 @@
+{
+  "method": "GET",
+  "url": "https://api.example.test/v1/items?limit=2",
+  "recorded_at": null,
+  "synthetic": true,
+  "response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": "{\"items\":[{\"id\":\"a\"},{\"id\":\"b\"}]}"
+  }
+}
