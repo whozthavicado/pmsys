@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from pmsys.core.errors import UpstreamError
 from pmsys.core.jsontypes import JsonValue
 
 _PATH = Path(__file__).parents[2] / "scripts" / "v2_sweep.py"
@@ -194,9 +195,10 @@ def test_main_writes_fixture_report_and_proposal_but_never_config(
         "resolved",
     }
     names = sorted(p.name for p in (tmp_path / "reports").iterdir())
-    assert names[0] == "uma_status_map.proposed.toml"
-    assert names[1].startswith("v2_sweep_")
-    report = json.loads((tmp_path / "reports" / names[1]).read_text(encoding="utf-8"))
+    assert "uma_status_map.proposed.toml" in names
+    assert "v2_state.json" in names
+    report_name = next(n for n in names if n.startswith("v2_sweep_"))
+    report = json.loads((tmp_path / "reports" / report_name).read_text(encoding="utf-8"))
     assert report["barrido_incompleto"] == []
     assert report["valores_sin_mapear_a_estado"] == []
     assert not (tmp_path / "config").exists()
@@ -243,7 +245,7 @@ def test_main_writes_progress_and_partial_checkpoint(
     assert code == 0
     assert "[open] página 1" in capsys.readouterr().err
     partial = json.loads((tmp_path / "r" / "v2_partial.json").read_text(encoding="utf-8"))
-    assert partial["mercados_vistos"] == 4  # checkpoint tras la página 2 de «open»
+    assert partial["mercados_vistos"] == 6  # el último guardado es el del fin de la pasada «closed»
 
 
 def test_write_atomic_replaces_the_file_and_leaves_no_temp(tmp_path: Path) -> None:
@@ -267,3 +269,183 @@ def test_write_atomic_keeps_the_previous_file_if_the_write_fails(
     with pytest.raises(OSError, match="disco lleno"):
         v2.write_atomic(target, "nuevo")
     assert target.read_text("utf-8") == "intacto"
+
+
+# ── Reanudación, cruce y paciencia ───────────────────────────────────────
+
+
+def _no_sleep(_s: float) -> None:
+    return None
+
+
+class DyingHttp(FakeHttp):
+    """Como FakeHttp, pero lanza un error tras ``die_after`` peticiones, como un corte largo."""
+
+    def __init__(self, pages_: Mapping[tuple[str, str | None], JsonValue], die_after: int) -> None:
+        super().__init__(pages_)
+        self.die_after = die_after
+
+    def get_json(self, url: str, params: Mapping[str, str] | None = None) -> JsonValue:
+        if len(self.calls) >= self.die_after:
+            raise UpstreamError(host="gamma-api.polymarket.com", status=0)
+        return super().get_json(url, params)
+
+
+def test_resume_after_a_crash_gives_the_same_result_as_an_uninterrupted_run() -> None:
+    whole = v2.sweep(FakeHttp(pages()), NOW)
+
+    saved: list[tuple[v2.SweepResult, v2.Cursor]] = []
+    snaps: list[str] = []
+
+    def keep(res: v2.SweepResult, cur: v2.Cursor) -> None:
+        snaps.append(v2.state_to_json(res, cur, "2026-11-10T12:00:00Z", 365))
+
+    with pytest.raises(UpstreamError):
+        v2.sweep(DyingHttp(pages(), die_after=2), NOW, on_checkpoint=keep, state=None, patience_s=0)
+    assert snaps, "debió guardar estado antes de caerse"
+
+    res0, cur0, observed, days = v2.state_from_json(snaps[-1])
+    assert (observed, days) == ("2026-11-10T12:00:00Z", 365)
+    saved.append((res0, cur0))
+    resumed = v2.sweep(FakeHttp(pages()), NOW, state=saved[0], on_checkpoint=keep)
+
+    def digest(r: v2.SweepResult) -> tuple[object, ...]:
+        return (
+            r.markets_seen,
+            {k: (s.count, s.open_count, s.closed_count) for k, s in r.values.items()},
+            {k: (c.values, c.null, c.absent) for k, c in r.cross.items()},
+            r.null_count,
+            r.missing_field_count,
+            r.pages,
+        )
+
+    assert digest(resumed) == digest(whole)
+
+
+def test_resume_does_not_recount_pages_already_in_the_saved_state() -> None:
+    snaps: list[str] = []
+    v2.sweep(
+        FakeHttp(pages()),
+        NOW,
+        on_checkpoint=lambda r, c: snaps.append(v2.state_to_json(r, c, "t", 365)),
+    )
+    # Con CHECKPOINT_EVERY=10 solo guarda al terminar una pasada; reanudar desde ahí no repite nada.
+    http = FakeHttp(pages())
+    res, cur, _o, _d = v2.state_from_json(snaps[-1])
+    again = v2.sweep(http, NOW, state=(res, cur))
+    assert http.calls == []
+    assert again.markets_seen == 6
+
+
+def test_resume_continues_from_the_saved_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(v2, "CHECKPOINT_EVERY", 1)
+    snaps: list[str] = []
+    with pytest.raises(UpstreamError):
+        v2.sweep(
+            DyingHttp(pages(), die_after=1),
+            NOW,
+            on_checkpoint=lambda r, c: snaps.append(v2.state_to_json(r, c, "t", 365)),
+        )
+    res, cur, _o, _d = v2.state_from_json(snaps[-1])
+    assert (cur.phase, cur.after, cur.pages_in_pass) == ("open", "c1", 1)
+    http = FakeHttp(pages())
+    v2.sweep(http, NOW, state=(res, cur))
+    first = http.calls[0][1]
+    assert first["after_cursor"] == "c1"  # retoma en la página 2, no en la 1
+    assert first["closed"] == "false"
+
+
+def test_crosstab_separates_null_and_absent_by_open_and_closed() -> None:
+    http = FakeHttp(
+        {
+            ("false", None): {"markets": [mk("1", None), mk("2"), mk("3", "proposed")]},
+            ("true", None): {"markets": [mk("4"), mk("5"), mk("6", "resolved"), mk("7", None)]},
+        }
+    )
+    res = v2.sweep(http, NOW)
+    cross = v2.crosstab_fixture(res, "2026-11-10T12:00:00Z")
+    assert cross["completo"] is True
+    assert cross["abiertos"] == {"valores": {"proposed": 1}, "null": 1, "campo_ausente": 1}
+    # Un cerrado sin campo es un resuelto sin estado: no se mezcla con un abierto sin propuesta.
+    assert cross["cerrados"] == {"valores": {"resolved": 1}, "null": 1, "campo_ausente": 2}
+
+
+def test_crosstab_is_marked_incomplete_when_the_page_cap_is_hit() -> None:
+    http = FakeHttp(
+        {
+            ("false", None): {"markets": [mk("1", "a")], "next_cursor": "c1"},
+            ("true", None): {"markets": []},
+        }
+    )
+    res = v2.sweep(http, NOW, max_pages=1)
+    assert v2.crosstab_fixture(res, "t")["completo"] is False
+
+
+def test_page_cap_is_per_pass_and_defaults_high_enough_for_the_first_run() -> None:
+    assert v2.DEFAULT_MAX_PAGES >= 10_000  # la pasada de cerrados pasó de 2.350 páginas
+    http = FakeHttp(
+        {
+            ("false", None): {"markets": [mk("1", "a")], "next_cursor": "c1"},
+            ("false", "c1"): {"markets": [mk("2", "a")]},
+            ("true", None): {"markets": [mk("3", "b")], "next_cursor": "c2"},
+            ("true", "c2"): {"markets": [mk("4", "b")]},
+        }
+    )
+    res = v2.sweep(http, NOW, max_pages=2)  # 2 por pasada: 4 en total sin marcar incompleto
+    assert res.truncated == []
+    assert res.markets_seen == 4
+
+
+def test_patience_retries_the_same_page_after_the_client_gives_up() -> None:
+    class Flaky(FakeHttp):
+        fails = 2
+
+        def get_json(self, url: str, params: Mapping[str, str] | None = None) -> JsonValue:
+            if self.fails > 0:
+                self.fails -= 1
+                raise UpstreamError(host="gamma-api.polymarket.com", status=0)
+            return super().get_json(url, params)
+
+    http = Flaky(pages())
+    sleeps: list[float] = []
+    res = v2.sweep(http, NOW, patience_s=600, sleep=sleeps.append)
+    assert res.markets_seen == 6
+    assert sleeps == [v2.PATIENCE_STEP_S, v2.PATIENCE_STEP_S]
+    # Agotada la paciencia, se rinde y propaga el error.
+    always = Flaky(pages())
+    always.fails = 99
+    with pytest.raises(UpstreamError):
+        v2.sweep(always, NOW, patience_s=120, sleep=_no_sleep)
+
+
+def test_state_file_rejects_garbage_and_other_versions() -> None:
+    with pytest.raises(v2.SweepAborted, match="ilegible"):
+        v2.state_from_json('{"hola": 1}')
+    with pytest.raises(v2.SweepAborted, match="ilegible"):
+        v2.state_from_json("no es json")
+    good = v2.state_to_json(v2.SweepResult(), v2.Cursor(), "t", 365)
+    bad = good.replace('"version":1', '"version":99')
+    with pytest.raises(v2.SweepAborted, match="otra versión"):
+        v2.state_from_json(bad)
+
+
+def test_main_refuses_to_overwrite_an_unfinished_state_and_resumes_with_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(v2, "CHECKPOINT_EVERY", 1)
+    base = [
+        "--fixture", str(tmp_path / "f.json"),
+        "--crosstab", str(tmp_path / "x.json"),
+        "--reports-dir", str(tmp_path / "r"),
+        "--patience-min", "0",
+    ]  # fmt: skip
+    code = v2.main(base, http=DyingHttp(pages(), die_after=2))
+    assert code == 4  # interrumpido, con estado guardado
+    assert (tmp_path / "r" / "v2_state.json").exists()
+    assert v2.main(base, http=FakeHttp(pages())) == 2  # sin --resume no pisa el estado
+    assert v2.main([*base, "--resume"], http=FakeHttp(pages())) == 0
+    crosstab = json.loads((tmp_path / "x.json").read_text("utf-8"))
+    assert crosstab["completo"] is True
+    assert crosstab["abiertos"]["null"] == 1
+    assert crosstab["abiertos"]["campo_ausente"] == 1
