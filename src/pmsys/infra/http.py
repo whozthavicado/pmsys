@@ -85,7 +85,20 @@ class TransportTimeout(Exception):
 
 
 class TransportError(Exception):
-    """Fallo de conexión sin respuesta HTTP (DNS, conexión rechazada, TLS...)."""
+    """Fallo transitorio del transporte, que el cliente reintenta.
+
+    Cubre tanto una conexión que no llegó a dar respuesta (DNS, conexión
+    rechazada, TLS, cierre sin respuesta) como una respuesta que empezó y se
+    cortó a media lectura (``IncompleteRead``).
+    """
+
+
+class InvalidRequest(ValueError):
+    """La petición misma es inválida (URL, puerto o esquema mal formado).
+
+    No es transitoria: el cliente NO la reintenta; se propaga al instante,
+    como cualquier otro error de programación.
+    """
 
 
 class Transport(Protocol):
@@ -123,6 +136,10 @@ class UrllibTransport:
         req = urllib.request.Request(url, data=body, headers=dict(headers), method=method)  # noqa: S310 - https validado por el cliente
         try:
             return self._exchange(req, timeout_s)
+        except http.client.InvalidURL as exc:
+            # Antes que el genérico: InvalidURL es una HTTPException, pero no
+            # mejora reintentándola.
+            raise InvalidRequest(str(exc)) from exc
         except TimeoutError as exc:
             raise TransportTimeout from exc
         except urllib.error.URLError as exc:

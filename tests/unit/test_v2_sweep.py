@@ -244,3 +244,26 @@ def test_main_writes_progress_and_partial_checkpoint(
     assert "[open] página 1" in capsys.readouterr().err
     partial = json.loads((tmp_path / "r" / "v2_partial.json").read_text(encoding="utf-8"))
     assert partial["mercados_vistos"] == 4  # checkpoint tras la página 2 de «open»
+
+
+def test_write_atomic_replaces_the_file_and_leaves_no_temp(tmp_path: Path) -> None:
+    target = tmp_path / "v2_partial.json"
+    target.write_text("viejo", "utf-8")
+    v2.write_atomic(target, '{"ok": true}')
+    assert target.read_text("utf-8") == '{"ok": true}'
+    assert [p.name for p in tmp_path.iterdir()] == ["v2_partial.json"]
+
+
+def test_write_atomic_keeps_the_previous_file_if_the_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "v2_partial.json"
+    target.write_text("intacto", "utf-8")
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise OSError("disco lleno")
+
+    monkeypatch.setattr(v2.os, "replace", boom)
+    with pytest.raises(OSError, match="disco lleno"):
+        v2.write_atomic(target, "nuevo")
+    assert target.read_text("utf-8") == "intacto"

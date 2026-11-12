@@ -17,6 +17,7 @@ from pmsys.infra.http import (
     DEFAULT_POLICIES,
     IDEMPOTENCY_HEADER,
     HostPolicy,
+    InvalidRequest,
     RetryingHttpClient,
     TokenBucket,
     TransportError,
@@ -408,6 +409,18 @@ def test_urllib_transport_maps_a_truncated_body_to_a_retryable_error() -> None:
         _send(_Opener(_CutResp(200, {}, b"")))
     with pytest.raises(TransportError):
         _send(_Opener(http.client.RemoteDisconnected("cerrada sin respuesta")))
+
+
+def test_invalid_url_is_not_retryable_and_fails_at_once() -> None:
+    with pytest.raises(InvalidRequest):
+        _send(_Opener(http.client.InvalidURL("puerto no numérico")))
+    # Y el cliente no la reintenta: ni espera ni segundo intento.
+    t = script(InvalidRequest("x"), ok())
+    timer = FakeTimer()
+    with pytest.raises(InvalidRequest):
+        client(t, timer).get_json(f"{BASE}/x")
+    assert len(t.sent) == 1
+    assert timer.sleeps == []
 
 
 def test_truncated_body_is_retried_by_the_client_and_then_succeeds() -> None:

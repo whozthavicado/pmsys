@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -243,6 +244,13 @@ def build_report(res: SweepResult, observed_at: str) -> dict[str, JsonValue]:
     }
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """Escribe a un temporal y lo mueve con ``os.replace``: nunca queda un fichero a medias."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, "utf-8")
+    os.replace(tmp, path)
+
+
 def _load(path: Path) -> Mapping[str, JsonValue] | None:
     if not path.exists():
         return None
@@ -271,9 +279,9 @@ def main(argv: list[str] | None = None, http: HttpClient | None = None) -> int:
                 f"valores {sorted(res.values)}\n"
             )
         if pages % CHECKPOINT_EVERY == 0:  # estado parcial, solo informativo (no es el fixture)
-            partial.write_text(
+            write_atomic(
+                partial,
                 json.dumps(build_report(res, observed_at), indent=2, ensure_ascii=False) + "\n",
-                "utf-8",
             )
 
     try:
