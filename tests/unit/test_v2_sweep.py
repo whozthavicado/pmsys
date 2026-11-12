@@ -218,3 +218,29 @@ def test_main_exit_codes_for_incomplete_and_aborted(
         {("false", None): {"a": [mk("1")], "b": [mk("2")]}, ("true", None): {"markets": []}}
     )
     assert v2.main(base, http=ambiguous) == 2
+
+
+def test_on_page_hook_sees_every_page_with_running_counts() -> None:
+    seen: list[tuple[str, int, int]] = []
+    v2.sweep(
+        FakeHttp(pages()),
+        NOW,
+        on_page=lambda name, n, res: seen.append((name, n, res.markets_seen)),
+    )
+    assert seen == [("open", 1, 2), ("open", 2, 4), ("closed", 1, 6)]
+
+
+def test_main_writes_progress_and_partial_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(v2, "PROGRESS_EVERY", 1)
+    monkeypatch.setattr(v2, "CHECKPOINT_EVERY", 2)
+    code = v2.main(
+        ["--fixture", str(tmp_path / "f.json"), "--reports-dir", str(tmp_path / "r")],
+        http=FakeHttp(pages()),
+    )
+    assert code == 0
+    assert "[open] página 1" in capsys.readouterr().err
+    partial = json.loads((tmp_path / "r" / "v2_partial.json").read_text(encoding="utf-8"))
+    assert partial["mercados_vistos"] == 4  # checkpoint tras la página 2 de «open»
