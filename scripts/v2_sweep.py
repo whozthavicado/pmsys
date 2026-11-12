@@ -54,6 +54,7 @@ DEFAULT_MAX_PAGES = 20_000
 DEFAULT_PATIENCE_MIN = 30
 PATIENCE_STEP_S = 60.0
 STATE_VERSION = 1
+OBSERVED_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 PAGE_LIMIT = 100  # máximo de /markets/keyset (VERIFICADO)
 STATES = ("open_no_proposal", "proposed", "disputed", "resolved")
 # Coincidencia exacta de nombre, solo como sugerencia: el mapeo real lo confirma una persona.
@@ -120,8 +121,13 @@ def next_cursor(body: JsonValue) -> str | None:
     return None
 
 
+def parse_observed(text: str) -> datetime:
+    """Inversa de ``_iso``; lanza ``ValueError`` si el texto no tiene ese formato."""
+    return datetime.strptime(text, OBSERVED_FORMAT).replace(tzinfo=UTC)
+
+
 def _iso(dt: datetime) -> str:
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.astimezone(UTC).strftime(OBSERVED_FORMAT)
 
 
 def _record(res: SweepResult, market: Mapping[str, JsonValue], *, closed: bool) -> None:
@@ -177,6 +183,13 @@ def _passes(now: datetime, closed_days: int) -> dict[str, dict[str, str]]:
     }
 
 
+def _is_transient(exc: Exception) -> bool:
+    """Un 4xx (salvo 429) es permanente: esperar no lo arregla, así que se propaga al instante."""
+    if isinstance(exc, UpstreamError):
+        return exc.status == 0 or exc.status >= 500
+    return True  # RateLimited y UpstreamTimeout
+
+
 def _get_page_patiently(
     http: HttpClient,
     params: Mapping[str, str],
@@ -189,8 +202,8 @@ def _get_page_patiently(
     while True:
         try:
             return http.get_json(f"{GAMMA}/markets/keyset", params)
-        except (UpstreamError, UpstreamTimeout, RateLimited):
-            if waited >= patience_s:
+        except (UpstreamError, UpstreamTimeout, RateLimited) as exc:
+            if not _is_transient(exc) or waited >= patience_s:
                 raise
             sys.stderr.write(
                 f"Gamma no responde; espero {PATIENCE_STEP_S:.0f} s y reintento esta página…\n"
@@ -342,6 +355,10 @@ def state_from_json(text: str) -> tuple[SweepResult, Cursor, str, int]:
         raise SweepAborted(
             "el estado guardado es de otra versión del script; bórralo y empieza de cero"
         )
+    try:
+        parse_observed(m.observado_en)
+    except ValueError as exc:
+        raise SweepAborted(f"estado guardado con fecha ilegible ({m.observado_en!r})") from exc
     cur = Cursor(
         phase=m.phase,
         after=m.after,
@@ -519,7 +536,7 @@ def main(argv: list[str] | None = None, http: HttpClient | None = None) -> int:
         res0, cur0, observed_at, closed_days = loaded
         state = (res0, cur0)
         # La ventana de fechas de la pasada de cerrados debe ser la de la corrida original.
-        now = datetime.strptime(observed_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        now = parse_observed(observed_at)
         sys.stderr.write(
             f"Reanudando: pasada «{cur0.phase}», página {cur0.pages_in_pass}, "
             f"{res0.markets_seen} mercados.\n"
@@ -554,8 +571,6 @@ def main(argv: list[str] | None = None, http: HttpClient | None = None) -> int:
             on_checkpoint=checkpoint,
             patience_s=args.patience_min * 60,
         )
-        if args.find_examples:
-            find_examples(client, res)
     except (SweepAborted, SchemaDrift) as exc:
         sys.stderr.write(f"V2 abortado: {exc}\n")
         return 2
@@ -565,6 +580,8 @@ def main(argv: list[str] | None = None, http: HttpClient | None = None) -> int:
         )
         return 4
 
+    # Los fixtures y el cruce no dependen de los ejemplos: se escriben ANTES de ``find_examples``,
+    # para que un fallo de red ahí no tire horas de barrido.
     args.fixture.parent.mkdir(parents=True, exist_ok=True)
     args.crosstab.parent.mkdir(parents=True, exist_ok=True)
     fixture = merge_fixture(_load(args.fixture), res, observed_at)
@@ -573,12 +590,21 @@ def main(argv: list[str] | None = None, http: HttpClient | None = None) -> int:
         args.crosstab,
         json.dumps(crosstab_fixture(res, observed_at), indent=2, ensure_ascii=False) + "\n",
     )
+    if args.find_examples:
+        try:
+            find_examples(client, res)
+        except (SweepAborted, SchemaDrift, UpstreamError, UpstreamTimeout, RateLimited) as exc:
+            sys.stderr.write(
+                f"No se pudieron buscar ejemplos abiertos ({exc}); el informe va sin ellos.\n"
+            )
     report = build_report(res, observed_at)
     write_atomic(
         args.reports_dir / f"v2_sweep_{now:%Y%m%d}.json",
         json.dumps(report, indent=2, ensure_ascii=False) + "\n",
     )
     write_atomic(args.reports_dir / "uma_status_map.proposed.toml", propose_map(res))
+    if not res.truncated:
+        state_path.unlink(missing_ok=True)  # corrida terminada: no bloquea la siguiente
 
     sys.stdout.write(
         f"{res.markets_seen} mercados; valores: {sorted(res.values)}; "

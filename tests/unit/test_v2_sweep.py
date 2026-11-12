@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from pmsys.core.errors import UpstreamError
+from pmsys.core.errors import UpstreamError, UpstreamTimeout
 from pmsys.core.jsontypes import JsonValue
 
 _PATH = Path(__file__).parents[2] / "scripts" / "v2_sweep.py"
@@ -196,7 +196,7 @@ def test_main_writes_fixture_report_and_proposal_but_never_config(
     }
     names = sorted(p.name for p in (tmp_path / "reports").iterdir())
     assert "uma_status_map.proposed.toml" in names
-    assert "v2_state.json" in names
+    assert "v2_state.json" not in names  # corrida terminada con éxito: el estado se borra
     report_name = next(n for n in names if n.startswith("v2_sweep_"))
     report = json.loads((tmp_path / "reports" / report_name).read_text(encoding="utf-8"))
     assert report["barrido_incompleto"] == []
@@ -327,7 +327,9 @@ def test_resume_does_not_recount_pages_already_in_the_saved_state() -> None:
     v2.sweep(
         FakeHttp(pages()),
         NOW,
-        on_checkpoint=lambda r, c: snaps.append(v2.state_to_json(r, c, "t", 365)),
+        on_checkpoint=lambda r, c: snaps.append(
+            v2.state_to_json(r, c, "2026-11-10T12:00:00Z", 365)
+        ),
     )
     # Con CHECKPOINT_EVERY=10 solo guarda al terminar una pasada; reanudar desde ahí no repite nada.
     http = FakeHttp(pages())
@@ -344,7 +346,9 @@ def test_resume_continues_from_the_saved_cursor(monkeypatch: pytest.MonkeyPatch)
         v2.sweep(
             DyingHttp(pages(), die_after=1),
             NOW,
-            on_checkpoint=lambda r, c: snaps.append(v2.state_to_json(r, c, "t", 365)),
+            on_checkpoint=lambda r, c: snaps.append(
+                v2.state_to_json(r, c, "2026-11-10T12:00:00Z", 365)
+            ),
         )
     res, cur, _o, _d = v2.state_from_json(snaps[-1])
     assert (cur.phase, cur.after, cur.pages_in_pass) == ("open", "c1", 1)
@@ -449,3 +453,68 @@ def test_main_refuses_to_overwrite_an_unfinished_state_and_resumes_with_flag(
     assert crosstab["completo"] is True
     assert crosstab["abiertos"]["null"] == 1
     assert crosstab["abiertos"]["campo_ausente"] == 1
+
+
+def test_a_4xx_is_permanent_and_does_not_burn_the_patience() -> None:
+    class Bad(FakeHttp):
+        def get_json(self, url: str, params: Mapping[str, str] | None = None) -> JsonValue:
+            self.calls.append((url, dict(params or {})))
+            raise UpstreamError(host="gamma-api.polymarket.com", status=400)
+
+    sleeps: list[float] = []
+    http = Bad(pages())
+    with pytest.raises(UpstreamError):
+        v2.sweep(http, NOW, patience_s=1800, sleep=sleeps.append)
+    assert sleeps == []
+    assert len(http.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "transient"), [(0, True), (500, True), (503, True), (400, False), (404, False)]
+)
+def test_transient_classification(status: int, transient: bool) -> None:
+    assert v2._is_transient(UpstreamError(host="h", status=status)) is transient
+    assert v2._is_transient(UpstreamTimeout(host="h")) is True
+
+
+def test_fixtures_are_written_even_if_find_examples_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    class ExamplesDown(FakeHttp):
+        def get_json(self, url: str, params: Mapping[str, str] | None = None) -> JsonValue:
+            if url.endswith("/markets"):
+                raise UpstreamError(host="gamma-api.polymarket.com", status=500)
+            return super().get_json(url, params)
+
+    code = v2.main(
+        [
+            "--find-examples",
+            "--fixture", str(tmp_path / "f.json"),
+            "--crosstab", str(tmp_path / "x.json"),
+            "--reports-dir", str(tmp_path / "r"),
+        ],
+        http=ExamplesDown(pages()),
+    )  # fmt: skip
+    assert code == 0
+    assert (tmp_path / "f.json").exists()
+    assert (tmp_path / "x.json").exists()
+
+
+def test_state_with_a_bad_date_is_a_clean_abort_not_a_traceback() -> None:
+    good = v2.state_to_json(v2.SweepResult(), v2.Cursor(), "2026-11-10T12:00:00Z", 365)
+    bad = good.replace("2026-11-10T12:00:00Z", "ayer por la tarde")
+    with pytest.raises(v2.SweepAborted, match="fecha ilegible"):
+        v2.state_from_json(bad)
+
+
+def test_a_finished_run_leaves_no_state_so_the_next_one_starts_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    base = ["--fixture", str(tmp_path / "f.json"), "--crosstab", str(tmp_path / "x.json"),
+            "--reports-dir", str(tmp_path / "r")]  # fmt: skip
+    assert v2.main(base, http=FakeHttp(pages())) == 0
+    assert not (tmp_path / "r" / "v2_state.json").exists()
+    assert v2.main(base, http=FakeHttp(pages())) == 0  # una segunda corrida no la bloquea nada
