@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -16,6 +17,7 @@ from pmsys.infra.http import (
     DEFAULT_POLICIES,
     IDEMPOTENCY_HEADER,
     HostPolicy,
+    InvalidRequest,
     RetryingHttpClient,
     TokenBucket,
     TransportError,
@@ -393,6 +395,39 @@ def test_urllib_transport_maps_timeouts_and_connection_errors() -> None:
         _send(_Opener(urllib.error.URLError(ConnectionRefusedError())))
     with pytest.raises(TransportError):
         _send(_Opener(ConnectionResetError()))
+
+
+class _CutResp(_FakeResp):
+    """Respuesta 200 cuyo cuerpo se corta a media lectura, como en el barrido V2."""
+
+    def read(self) -> bytes:
+        raise http.client.IncompleteRead(b"x" * 10, 25)
+
+
+def test_urllib_transport_maps_a_truncated_body_to_a_retryable_error() -> None:
+    with pytest.raises(TransportError):
+        _send(_Opener(_CutResp(200, {}, b"")))
+    with pytest.raises(TransportError):
+        _send(_Opener(http.client.RemoteDisconnected("cerrada sin respuesta")))
+
+
+def test_invalid_url_is_not_retryable_and_fails_at_once() -> None:
+    with pytest.raises(InvalidRequest):
+        _send(_Opener(http.client.InvalidURL("puerto no numérico")))
+    # Y el cliente no la reintenta: ni espera ni segundo intento.
+    t = script(InvalidRequest("x"), ok())
+    timer = FakeTimer()
+    with pytest.raises(InvalidRequest):
+        client(t, timer).get_json(f"{BASE}/x")
+    assert len(t.sent) == 1
+    assert timer.sleeps == []
+
+
+def test_truncated_body_is_retried_by_the_client_and_then_succeeds() -> None:
+    t = script(TransportError(), ok())
+    timer = FakeTimer()
+    assert client(t, timer).get_json(f"{BASE}/x") == {"ok": True}
+    assert len(t.sent) == 2
 
 
 def test_default_urllib_opener_does_not_follow_redirects() -> None:

@@ -6,6 +6,7 @@ y ``uniform`` (jitter). Los tests no abren sockets (pytest-socket los bloquea).
 
 from __future__ import annotations
 
+import http.client
 import json
 import random
 import socket
@@ -84,7 +85,20 @@ class TransportTimeout(Exception):
 
 
 class TransportError(Exception):
-    """Fallo de conexión sin respuesta HTTP (DNS, conexión rechazada, TLS...)."""
+    """Fallo transitorio del transporte, que el cliente reintenta.
+
+    Cubre tanto una conexión que no llegó a dar respuesta (DNS, conexión
+    rechazada, TLS, cierre sin respuesta) como una respuesta que empezó y se
+    cortó a media lectura (``IncompleteRead``).
+    """
+
+
+class InvalidRequest(ValueError):
+    """La petición misma es inválida (URL, puerto o esquema mal formado).
+
+    No es transitoria: el cliente NO la reintenta; se propaga al instante,
+    como cualquier otro error de programación.
+    """
 
 
 class Transport(Protocol):
@@ -121,6 +135,25 @@ class UrllibTransport:
     ) -> TransportResponse:
         req = urllib.request.Request(url, data=body, headers=dict(headers), method=method)  # noqa: S310 - https validado por el cliente
         try:
+            return self._exchange(req, timeout_s)
+        except http.client.InvalidURL as exc:
+            # Antes que el genérico: InvalidURL es una HTTPException, pero no
+            # mejora reintentándola.
+            raise InvalidRequest(str(exc)) from exc
+        except TimeoutError as exc:
+            raise TransportTimeout from exc
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError | socket.timeout):
+                raise TransportTimeout from exc
+            raise TransportError from exc
+        except (OSError, http.client.HTTPException) as exc:
+            # HTTPException cubre una respuesta cortada a media lectura
+            # (IncompleteRead) o una conexión cerrada sin respuesta: no es un
+            # OSError, pero es tan transitorio como uno y se reintenta igual.
+            raise TransportError from exc
+
+    def _exchange(self, req: urllib.request.Request, timeout_s: float) -> TransportResponse:
+        try:
             with self._opener.open(req, timeout=timeout_s) as resp:
                 return TransportResponse(
                     status=resp.getcode() or 0,
@@ -128,19 +161,13 @@ class UrllibTransport:
                     body=resp.read(),
                 )
         except urllib.error.HTTPError as exc:
+            # Un error HTTP sigue siendo una respuesta; leer su cuerpo también
+            # puede cortarse, y eso lo atrapa `send`.
             return TransportResponse(
                 status=exc.code,
                 headers={k.lower(): v for k, v in exc.headers.items()},
                 body=exc.read(),
             )
-        except TimeoutError as exc:
-            raise TransportTimeout from exc
-        except urllib.error.URLError as exc:
-            if isinstance(exc.reason, TimeoutError | socket.timeout):
-                raise TransportTimeout from exc
-            raise TransportError from exc
-        except OSError as exc:
-            raise TransportError from exc
 
 
 class HttpClient(Protocol):

@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -36,6 +37,8 @@ from pmsys.infra.http import HttpClient, RetryingHttpClient, UrllibTransport
 
 GAMMA = "https://gamma-api.polymarket.com"
 STATUS_FIELD = "umaResolutionStatus"
+PROGRESS_EVERY = 10
+CHECKPOINT_EVERY = 50
 PAGE_LIMIT = 100  # máximo de /markets/keyset (VERIFICADO)
 STATES = ("open_no_proposal", "proposed", "disputed", "resolved")
 # Coincidencia exacta de nombre, solo como sugerencia: el mapeo real lo confirma una persona.
@@ -120,8 +123,16 @@ def _record(res: SweepResult, market: Mapping[str, JsonValue], *, closed: bool) 
         stat.example_open_id = stat.example_open_id or mid
 
 
+PageHook = Callable[[str, int, SweepResult], None]
+
+
 def sweep(
-    http: HttpClient, now: datetime, *, max_pages: int = 5000, closed_days: int = 365
+    http: HttpClient,
+    now: datetime,
+    *,
+    max_pages: int = 5000,
+    closed_days: int = 365,
+    on_page: PageHook | None = None,
 ) -> SweepResult:
     """Barrido completo: abiertos (sin fecha) y cerrados de los últimos ``closed_days`` días."""
     res = SweepResult()
@@ -143,8 +154,11 @@ def sweep(
                 params["after_cursor"] = cursor
             body = http.get_json(f"{GAMMA}/markets/keyset", params)
             pages += 1
+            res.pages[name] = pages
             for market in extract_markets(body):
                 _record(res, market, closed=name == "closed")
+            if on_page is not None:
+                on_page(name, pages, res)
             cursor = next_cursor(body)
             if cursor is None:
                 break
@@ -154,7 +168,6 @@ def sweep(
             if pages >= max_pages:
                 res.truncated.append(name)  # barrido incompleto: no sirve para cerrar V2
                 break
-        res.pages[name] = pages
     return res
 
 
@@ -231,6 +244,13 @@ def build_report(res: SweepResult, observed_at: str) -> dict[str, JsonValue]:
     }
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """Escribe a un temporal y lo mueve con ``os.replace``: nunca queda un fichero a medias."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, "utf-8")
+    os.replace(tmp, path)
+
+
 def _load(path: Path) -> Mapping[str, JsonValue] | None:
     if not path.exists():
         return None
@@ -249,15 +269,29 @@ def main(argv: list[str] | None = None, http: HttpClient | None = None) -> int:
     now = datetime.now(UTC)
     observed_at = _iso(now)
     client = http or RetryingHttpClient(UrllibTransport())
+    args.reports_dir.mkdir(parents=True, exist_ok=True)
+    partial = args.reports_dir / "v2_partial.json"
+
+    def progress(name: str, pages: int, res: SweepResult) -> None:
+        if pages % PROGRESS_EVERY == 0:
+            sys.stderr.write(
+                f"[{name}] página {pages}: {res.markets_seen} mercados, "
+                f"valores {sorted(res.values)}\n"
+            )
+        if pages % CHECKPOINT_EVERY == 0:  # estado parcial, solo informativo (no es el fixture)
+            write_atomic(
+                partial,
+                json.dumps(build_report(res, observed_at), indent=2, ensure_ascii=False) + "\n",
+            )
+
     try:
-        res = sweep(client, now, max_pages=args.max_pages)
+        res = sweep(client, now, max_pages=args.max_pages, on_page=progress)
         if args.find_examples:
             find_examples(client, res)
     except (SweepAborted, SchemaDrift) as exc:
         sys.stderr.write(f"V2 abortado: {exc}\n")
         return 2
 
-    args.reports_dir.mkdir(parents=True, exist_ok=True)
     args.fixture.parent.mkdir(parents=True, exist_ok=True)
     fixture = merge_fixture(_load(args.fixture), res, observed_at)
     args.fixture.write_text(json.dumps(fixture, indent=2, ensure_ascii=False) + "\n", "utf-8")
